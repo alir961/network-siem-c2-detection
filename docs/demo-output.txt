@@ -1,0 +1,32 @@
+================================================================
+  Source    : pcap demo/incident.pcap
+  IOCs      : 1 IPs, 1 domains
+  Response  : iptables block (dry run)
+  Alerting  : console + log only
+  Log file  : /tmp/siem_logs/alerts.jsonl
+================================================================
+[2026-03-05T04:00:00Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 192.168.5.1     c2_domain=goog1e.eu proto=DNS
+[2026-03-05T04:00:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+                        [BLOCK] iptables DROP in/out 116.202.5.225 (dry run)
+[2026-03-05T04:00:01Z] [CRITICAL] HTTP_C2_PATTERN        192.168.5.100 -> 116.202.5.225   method=POST host=goog1e.eu path=/beacon c2_host=True c2_endpoint=True
+[2026-03-05T04:02:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+[2026-03-05T04:02:01Z] [CRITICAL] HTTP_C2_PATTERN        192.168.5.100 -> 116.202.5.225   method=POST host=goog1e.eu path=/beacon c2_host=True c2_endpoint=True
+[2026-03-05T04:04:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+[2026-03-05T04:04:01Z] [CRITICAL] HTTP_C2_PATTERN        192.168.5.100 -> 116.202.5.225   method=POST host=goog1e.eu path=/beacon c2_host=True c2_endpoint=True
+[2026-03-05T04:05:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+[2026-03-05T04:05:01Z] [CRITICAL] C2_EXFIL_VOLUME        192.168.5.100 -> 116.202.5.225   bytes=200595 window_sec=300
+[2026-03-05T04:05:10Z] [CRITICAL] DNS_DGA_SUSPECT        192.168.5.100 -> 192.168.5.1     domain=xk7qp9m3bvzw1.top entropy=3.7
+[2026-03-05T04:05:20Z] [HIGH    ] C2_SUSPICIOUS_PORT     192.168.5.100 -> 203.0.113.66    dport=4444
+                        [BLOCK] iptables DROP in/out 203.0.113.66 (dry run)
+[2026-03-05T04:06:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+[2026-03-05T04:06:01Z] [CRITICAL] HTTP_C2_PATTERN        192.168.5.100 -> 116.202.5.225   method=POST host=goog1e.eu path=/beacon c2_host=True c2_endpoint=True
+[2026-03-05T04:06:40Z] [HIGH    ] PORT_SCAN              198.51.100.23 -> 192.168.5.100   unique_ports=21 window_sec=0.0
+                        [BLOCK] iptables DROP in/out 198.51.100.23 (dry run)
+[2026-03-05T04:08:01Z] [CRITICAL] C2_DIRECT_HIT          192.168.5.100 -> 116.202.5.225   c2_ip=116.202.5.225 port=80 proto=TCP direction=outbound
+[2026-03-05T04:08:01Z] [HIGH    ] C2_BEACON              192.168.5.100 -> 116.202.5.225   interval_sec=120.0 regular_intervals=3 connections=6
+[2026-03-05T04:08:01Z] [CRITICAL] HTTP_C2_PATTERN        192.168.5.100 -> 116.202.5.225   method=POST host=goog1e.eu path=/beacon c2_host=True c2_endpoint=True
+[2026-03-05T04:08:20Z] [HIGH    ] ICMP_DATA_TUNNEL       192.168.5.100 -> 203.0.113.99    payload_bytes=512
+                        [BLOCK] iptables DROP in/out 203.0.113.99 (dry run)
+
+[SIEM] 237 packets, 18 alerts (157 duplicates suppressed)
+[SIEM] Blocked: 116.202.5.225, 198.51.100.23, 203.0.113.66, 203.0.113.99
