@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "network-siem"
+version = "1.0.0"
+description = "Network SIEM: C2, exfiltration and reconnaissance detection with active response"
+requires-python = ">=3.10"
+dependencies = ["scapy>=2.5", "requests>=2.31"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+siem = "siem.main:main"
+
+[tool.setuptools]
+packages = ["siem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

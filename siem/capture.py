@@ -1,97 +1,88 @@
 """
-Scapy packet capture loop with detection and optional active blocking.
+Packet pipeline: capture (live or pcap replay) → detection → dedup → log / alert / block.
 """
 from __future__ import annotations
 
-import subprocess
 import time
-from typing import Optional
 
-from scapy.all import sniff, conf as scapy_conf
+from scapy.all import PcapReader, sniff
+from scapy.all import conf as scapy_conf
 
-from .rules import DetectionEngine
 from .alert import AlertDispatcher
-from .logger import SIEMLogger
 from .config import THRESHOLDS
+from .firewall import Firewall
+from .logger import SIEMLogger
+from .rules import DetectionEngine
 
 
 class SIEMCapture:
     def __init__(
         self,
-        interface:    str,
-        engine:       DetectionEngine,
-        dispatcher:   AlertDispatcher,
-        logger:       SIEMLogger,
-        block_mode:   bool = False,
-        verbose:      bool = True,
+        engine: DetectionEngine,
+        dispatcher: AlertDispatcher,
+        logger: SIEMLogger,
+        firewall: Firewall | None = None,
+        verbose: bool = True,
     ) -> None:
-        self._iface      = interface
-        self._engine     = engine
+        self._engine = engine
         self._dispatcher = dispatcher
-        self._logger     = logger
-        self._block      = block_mode
-        self._verbose    = verbose
-
-        # Deduplication : rule:src:dst → last_alert timestamp
+        self._logger = logger
+        self._firewall = firewall
+        self._verbose = verbose
         self._dedup: dict[str, float] = {}
+        self.stats: dict[str, int] = {"packets": 0, "alerts": 0, "suppressed": 0}
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def start(self, packet_filter: str = "") -> None:
+    def live(self, interface: str, packet_filter: str = "") -> None:
         scapy_conf.verb = 0
-        print(f"[SIEM] Starting on interface '{self._iface}'"
-              f"{' (BLOCK mode)' if self._block else ''}")
-        print(f"[SIEM] Log file: {self._logger._path}")
-        sniff(iface=self._iface, prn=self._process, store=False,
-              filter=packet_filter or None)
+        sniff(iface=interface, prn=self.process, store=False, filter=packet_filter or None)
+
+    def replay(self, pcap_path: str) -> None:
+        """Run a capture file through the engine, using the packets' own timestamps."""
+        with PcapReader(pcap_path) as reader:
+            for pkt in reader:
+                self.process(pkt, now=float(pkt.time))
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _process(self, pkt) -> None:
-        alerts = self._engine.analyze(pkt)
-        for alert in alerts:
-            if not self._should_emit(alert):
-                continue
+    def process(self, pkt, now: float | None = None) -> None:
+        replay = now is not None
+        if now is None:
+            now = time.monotonic()
+        self.stats["packets"] += 1
 
-            entry = self._logger.log(
-                alert["rule"],
-                alert["severity"],
-                alert["src"],
-                alert["dst"],
-                alert["details"],
-            )
+        for alert in self._engine.analyze(pkt, now=now):
+            if not self._should_emit(alert, now):
+                self.stats["suppressed"] += 1
+                continue
+            self.stats["alerts"] += 1
+
+            entry = self._logger.log(alert, epoch=now if replay else None)
             self._dispatcher.send(entry)
 
-            if self._verbose:
-                print(
-                    f"[{entry['timestamp']}] [{entry['severity']:8s}] "
-                    f"{entry['rule']:<22} {entry['src']:>15} -> {entry['dst']}"
-                )
+            if self._verbose or alert["severity"] == "CRITICAL":
+                print(f"[{entry['timestamp']}] [{entry['severity']:<8}] "
+                      f"{entry['rule']:<20} {entry['src']:>15} -> {entry['dst']:<15} "
+                      f"{_short(entry['details'])}")
 
-            if self._block and alert["severity"] in ("HIGH", "CRITICAL"):
-                self._block_ip(alert["dst"])
+            if self._firewall:
+                ip = self._firewall.should_block(alert)
+                if ip and self._firewall.block(ip):
+                    mode = " (dry run)" if self._firewall.dry_run else ""
+                    print(f"{'':>24}[BLOCK] iptables DROP in/out {ip}{mode}")
 
-    def _should_emit(self, alert: dict) -> bool:
+    def _should_emit(self, alert: dict, now: float) -> bool:
+        window = THRESHOLDS["alert_dedup_window_sec"]
         key = f"{alert['rule']}:{alert['src']}:{alert['dst']}"
-        now = time.monotonic()
-        last = self._dedup.get(key, 0.0)
-        if now - last < THRESHOLDS["alert_dedup_window_sec"]:
+        if now - self._dedup.get(key, float("-inf")) < window:
             return False
         self._dedup[key] = now
+        if len(self._dedup) > 10_000:  # keep memory bounded on long runs
+            self._dedup = {k: t for k, t in self._dedup.items() if now - t < window}
         return True
 
-    def _block_ip(self, ip: str) -> None:
-        try:
-            subprocess.run(
-                ["iptables", "-I", "OUTPUT", "-d", ip, "-j", "DROP"],
-                check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"],
-                check=True, capture_output=True,
-            )
-            print(f"[BLOCK] iptables DROP <-> {ip}")
-        except subprocess.CalledProcessError as exc:
-            print(f"[BLOCK ERROR] {exc.stderr.decode().strip()}")
-        except FileNotFoundError:
-            print("[BLOCK ERROR] iptables not found — are you root?")
+
+def _short(details: dict) -> str:
+    text = " ".join(f"{k}={v}" for k, v in details.items() if k != "user_agent")
+    return text if len(text) <= 100 else text[:99] + "…"

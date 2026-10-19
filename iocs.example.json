@@ -1,0 +1,5 @@
+{
+  "c2_ips": ["116.202.5.225"],
+  "c2_domains": ["goog1e.eu"],
+  "c2_endpoints": ["/ping", "/beacon", "/upload", "/result", "/agent_version", "/agent_download"]
+}

@@ -1,219 +1,246 @@
 """
-Detection engine — G-SEC-910 Hôpital Mandé SIEM.
-R01 C2_DIRECT_HIT / R02 C2_BEACON / R03 C2_EXFIL_VOLUME /
-R04 C2_SUSPICIOUS_PORT / R05 DNS_HIGH_RATE / R06 DNS_DGA_SUSPECT /
-R07 PORT_SCAN / R08 ICMP_DATA_TUNNEL / R09 HTTP_C2_PATTERN
+Detection engine.
+
+R01 C2_DIRECT_HIT       traffic to a known C2 IP, or a lookup of a C2 domain
+R02 C2_BEACON           outbound connections repeating at a regular interval
+R03 C2_EXFIL_VOLUME     large outbound volume to one external host
+R04 C2_SUSPICIOUS_PORT  outbound connection to a common reverse-shell port
+R05 DNS_HIGH_RATE       abnormal DNS query rate (DGA / tunnelling)
+R06 DNS_DGA_SUSPECT     high-entropy domain label
+R07 PORT_SCAN           one source probing many ports on one host
+R08 ICMP_DATA_TUNNEL    ICMP echo carrying an oversized payload
+R09 HTTP_C2_PATTERN     HTTP request matching the C2 host / endpoints / user-agent
+
+Every alert carries an `offender`: the external party the alert is about,
+which is what active blocking acts on (never the protected host itself).
 """
 from __future__ import annotations
 
 import ipaddress
 import math
 import time
-from collections import defaultdict, deque
-from scapy.layers.dns import DNS, DNSQR
-from scapy.layers.inet import IP, TCP, UDP, ICMP
-from scapy.layers.http import HTTP, HTTPRequest
+from collections import Counter, defaultdict, deque
 
-from .config import (
-    C2_IPS, C2_DOMAINS, C2_PORTS, C2_ENDPOINTS,
-    INTERNAL_SUBNETS, WHITELIST_IPS, THRESHOLDS,
-)
+from scapy.layers.dns import DNS, DNSQR
+from scapy.layers.http import HTTPRequest
+from scapy.layers.inet import ICMP, IP, TCP, UDP
+
+from .config import DEFAULT_IOCS, INTERNAL_SUBNETS, THRESHOLDS, WHITELIST_IPS, IOCs
+
+_INTERNAL_NETS = [ipaddress.ip_network(n) for n in INTERNAL_SUBNETS]
+
+
+def is_internal(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _INTERNAL_NETS)
 
 
 class DetectionEngine:
-    def __init__(self) -> None:
-        # R02 — beaconing tracker : dst_ip → deque of connection timestamps
+    def __init__(self, iocs: IOCs | None = None, thresholds: dict | None = None) -> None:
+        self.iocs = iocs or DEFAULT_IOCS
+        self.t = {**THRESHOLDS, **(thresholds or {})}
+
+        # R02: dst_ip -> timestamps of new connections
         self._beacon: dict[str, deque] = defaultdict(lambda: deque(maxlen=30))
-
-        # R03 — exfil tracker : dst_ip → total bytes sent
-        self._exfil_bytes: dict[str, int] = defaultdict(int)
-        self._exfil_reset: dict[str, float] = defaultdict(float)
-
-        # R05 — DNS rate tracker
-        self._dns_ts: deque = deque(maxlen=500)
-
-        # R07 — port scan tracker : src_ip → {(dst_ip, dst_port)} + first_seen
-        self._scan_ports: dict[str, set] = defaultdict(set)
-        self._scan_first:  dict[str, float] = {}
+        # R03: dst_ip -> sliding window of (timestamp, bytes)
+        self._exfil: dict[str, deque] = defaultdict(deque)
+        self._exfil_total: dict[str, int] = defaultdict(int)
+        # R05: timestamps of DNS queries
+        self._dns_ts: deque = deque(maxlen=1000)
+        # R07: (src, dst) -> [set of ports, window_start]
+        self._scan: dict[tuple[str, str], list] = {}
 
     # ────────────────────────────────────────────────────────────────────────
 
-    def analyze(self, pkt) -> list[dict]:
+    def analyze(self, pkt, now: float | None = None) -> list[dict]:
+        """Return the alerts raised by one packet.
+
+        `now` lets callers replay captures with their original timing;
+        live capture uses the monotonic clock.
+        """
         if not pkt.haslayer(IP):
             return []
+        if now is None:
+            now = time.monotonic()
 
-        alerts: list[dict] = []
         src: str = pkt[IP].src
         dst: str = pkt[IP].dst
-        now: float = time.monotonic()
-
-        # Skip loopback and whitelisted
-        if src == "127.0.0.1" or src in WHITELIST_IPS:
+        if src.startswith("127.") or src in WHITELIST_IPS or dst in WHITELIST_IPS:
             return []
 
-        # ── R01 — C2 direct hit ─────────────────────────────────────────────
-        if dst in C2_IPS:
-            proto_name = self._proto_name(pkt)
-            dport = pkt[TCP].dport if pkt.haslayer(TCP) else (pkt[UDP].dport if pkt.haslayer(UDP) else 0)
-            alerts.append(self._mk("C2_DIRECT_HIT", "CRITICAL", src, dst, {
-                "c2_ip":   dst,
-                "c2_port": dport,
-                "proto":   proto_name,
-                "note":    "Known C2 server goog1e.eu (116.202.5.225)",
+        outbound = not is_internal(dst)
+        alerts: list[dict] = []
+
+        tcp = pkt[TCP] if pkt.haslayer(TCP) else None
+        syn_only = tcp is not None and "S" in tcp.flags and "A" not in tcp.flags
+        new_flow = syn_only or (pkt.haslayer(UDP) and not pkt.haslayer(DNS))
+
+        # R01: C2 direct hit
+        if dst in self.iocs.c2_ips or src in self.iocs.c2_ips:
+            c2 = dst if dst in self.iocs.c2_ips else src
+            alerts.append(self._mk("C2_DIRECT_HIT", "CRITICAL", src, dst, c2, {
+                "c2_ip": c2,
+                "port": self._dport(pkt),
+                "proto": self._proto_name(pkt),
+                "direction": "outbound" if c2 == dst else "inbound",
             }))
 
-        # ── R02 — beaconing ─────────────────────────────────────────────────
-        if not self._is_internal(dst) and (pkt.haslayer(TCP) or pkt.haslayer(UDP)):
+        # R02: beaconing, measured on new connections, not on every packet of a stream
+        if outbound and new_flow:
             ts_q = self._beacon[dst]
             ts_q.append(now)
-            n = THRESHOLDS["beaconing_min_count"]
-            # Only consider timestamps within the observation window
-            window = THRESHOLDS["beaconing_window_sec"]
+            window = self.t["beaconing_window_sec"]
             recent = [t for t in ts_q if t >= now - window]
-            if len(recent) >= n:
-                intervals = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
-                if intervals:
-                    avg = sum(intervals) / len(intervals)
-                    variance = sum((x - avg)**2 for x in intervals) / len(intervals)
-                    min_iv = THRESHOLDS["beaconing_min_interval"]
-                    if (avg >= min_iv
-                            and variance < THRESHOLDS["beaconing_variance_max"]
-                            and avg <= window / 2):
-                        alerts.append(self._mk("C2_BEACON", "HIGH", src, dst, {
-                            "avg_interval_sec": round(avg, 2),
-                            "variance":         round(variance, 4),
-                            "sample_count":     len(recent),
-                        }))
+            if len(recent) >= self.t["beaconing_min_count"]:
+                # Look for a dominant interval: other connections to the same host
+                # (uploads, updates) must not hide an otherwise regular heartbeat.
+                intervals = sorted(b - a for a, b in zip(recent, recent[1:], strict=False))
+                median = intervals[len(intervals) // 2]
+                tolerance = max(1.0, median * self.t["beaconing_jitter_ratio"])
+                regular = [x for x in intervals if abs(x - median) <= tolerance]
+                if (median >= self.t["beaconing_min_interval"]
+                        and len(regular) >= self.t["beaconing_min_count"] - 1):
+                    alerts.append(self._mk("C2_BEACON", "HIGH", src, dst, dst, {
+                        "interval_sec": round(median, 2),
+                        "regular_intervals": len(regular),
+                        "connections": len(recent),
+                    }))
 
-        # ── R03 — exfiltration volume ────────────────────────────────────────
-        if not self._is_internal(dst):
-            payload_len = len(bytes(pkt[IP].payload)) if pkt.haslayer(IP) else 0
-            # Reset counter after window
-            if now - self._exfil_reset[dst] > 300:
-                self._exfil_bytes[dst] = 0
-                self._exfil_reset[dst] = now
-            self._exfil_bytes[dst] += payload_len
-            if self._exfil_bytes[dst] > THRESHOLDS["exfil_bytes_threshold"]:
-                alerts.append(self._mk("C2_EXFIL_VOLUME", "CRITICAL", src, dst, {
-                    "total_bytes": self._exfil_bytes[dst],
-                    "threshold":   THRESHOLDS["exfil_bytes_threshold"],
+        # R03: exfiltration volume over a sliding window
+        if outbound:
+            size = len(bytes(pkt[IP].payload))
+            win = self._exfil[dst]
+            win.append((now, size))
+            self._exfil_total[dst] += size
+            while win and win[0][0] < now - self.t["exfil_window_sec"]:
+                self._exfil_total[dst] -= win.popleft()[1]
+            if self._exfil_total[dst] > self.t["exfil_bytes_threshold"]:
+                alerts.append(self._mk("C2_EXFIL_VOLUME", "CRITICAL", src, dst, dst, {
+                    "bytes": self._exfil_total[dst],
+                    "window_sec": self.t["exfil_window_sec"],
                 }))
-                self._exfil_bytes[dst] = 0  # reset to avoid spam
+                win.clear()
+                self._exfil_total[dst] = 0
 
-        # ── R04 — suspicious outbound port ──────────────────────────────────
-        if pkt.haslayer(TCP) and not self._is_internal(dst):
-            dport = pkt[TCP].dport
-            if dport in THRESHOLDS["suspicious_ports"]:
-                alerts.append(self._mk("C2_SUSPICIOUS_PORT", "HIGH", src, dst, {
-                    "dport": dport,
-                    "flags": str(pkt[TCP].flags),
-                }))
+        # R04: suspicious outbound port
+        if syn_only and outbound and tcp.dport in self.t["suspicious_ports"]:
+            alerts.append(self._mk("C2_SUSPICIOUS_PORT", "HIGH", src, dst, dst, {
+                "dport": tcp.dport,
+            }))
 
-        # ── R05 — DNS high rate ──────────────────────────────────────────────
-        if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
+        # R05 / R06: DNS (queries only, so responses are not counted twice)
+        if pkt.haslayer(DNS) and pkt[DNS].qr == 0 and pkt.haslayer(DNSQR):
             qname = self._decode_dns(pkt[DNSQR].qname)
             self._dns_ts.append(now)
-            cutoff = now - THRESHOLDS["dns_rate_window_sec"]
+            cutoff = now - self.t["dns_rate_window_sec"]
             while self._dns_ts and self._dns_ts[0] < cutoff:
                 self._dns_ts.popleft()
-            if len(self._dns_ts) > THRESHOLDS["dns_rate_threshold"]:
-                alerts.append(self._mk("DNS_HIGH_RATE", "HIGH", src, dst, {
-                    "count_per_min": len(self._dns_ts),
-                    "last_query":    qname,
+            if len(self._dns_ts) > self.t["dns_rate_threshold"]:
+                alerts.append(self._mk("DNS_HIGH_RATE", "HIGH", src, dst, None, {
+                    "queries_in_window": len(self._dns_ts),
+                    "last_query": qname,
                 }))
 
-            # ── R06 — DGA suspect ────────────────────────────────────────────
             label = qname.split(".")[0] if qname else ""
-            if (len(label) >= THRESHOLDS["dga_min_label_length"]
-                    and self._entropy(label) >= THRESHOLDS["dga_entropy_threshold"]):
-                alerts.append(self._mk("DNS_DGA_SUSPECT", "CRITICAL", src, dst, {
-                    "domain":  qname,
-                    "label":   label,
-                    "entropy": round(self._entropy(label), 3),
+            entropy = self._entropy(label)
+            if len(label) >= self.t["dga_min_label_length"] and entropy >= self.t["dga_entropy_threshold"]:
+                alerts.append(self._mk("DNS_DGA_SUSPECT", "CRITICAL", src, dst, None, {
+                    "domain": qname,
+                    "entropy": round(entropy, 3),
+                }))
+            if any(qname == d or qname.endswith("." + d) for d in self.iocs.c2_domains):
+                alerts.append(self._mk("C2_DIRECT_HIT", "CRITICAL", src, dst, None, {
+                    "c2_domain": qname,
+                    "proto": "DNS",
                 }))
 
-        # ── R07 — port scan ──────────────────────────────────────────────────
-        if pkt.haslayer(TCP):
-            dport = pkt[TCP].dport
-            key = f"{src}"
-            if key not in self._scan_first:
-                self._scan_first[key] = now
-            # Reset window
-            if now - self._scan_first[key] > THRESHOLDS["port_scan_window_sec"]:
-                self._scan_ports[key] = set()
-                self._scan_first[key] = now
-            self._scan_ports[key].add((dst, dport))
-            if len(self._scan_ports[key]) > THRESHOLDS["port_scan_threshold"]:
-                alerts.append(self._mk("PORT_SCAN", "HIGH", src, dst, {
-                    "unique_dst_ports": len(self._scan_ports[key]),
-                    "window_sec":       round(now - self._scan_first[key], 1),
+        # R07: vertical port scan, counted on connection attempts only
+        if syn_only:
+            key = (src, dst)
+            state = self._scan.get(key)
+            if state is None or now - state[1] > self.t["port_scan_window_sec"]:
+                state = self._scan[key] = [set(), now]
+            state[0].add(tcp.dport)
+            if len(state[0]) > self.t["port_scan_threshold"]:
+                offender = src if not is_internal(src) else None
+                alerts.append(self._mk("PORT_SCAN", "HIGH", src, dst, offender, {
+                    "unique_ports": len(state[0]),
+                    "window_sec": round(now - state[1], 1),
                 }))
-                self._scan_ports[key] = set()
+                self._scan[key] = [set(), now]
 
-        # ── R08 — ICMP data tunnel ───────────────────────────────────────────
-        if pkt.haslayer(ICMP):
+        # R08: ICMP data tunnel (echo request / reply only)
+        if pkt.haslayer(ICMP) and pkt[ICMP].type in (0, 8):
             payload_size = len(bytes(pkt[ICMP].payload))
-            if payload_size > THRESHOLDS["icmp_payload_threshold"]:
-                alerts.append(self._mk("ICMP_DATA_TUNNEL", "HIGH", src, dst, {
+            if payload_size > self.t["icmp_payload_threshold"]:
+                remote = dst if outbound else (src if not is_internal(src) else None)
+                alerts.append(self._mk("ICMP_DATA_TUNNEL", "HIGH", src, dst, remote, {
                     "payload_bytes": payload_size,
-                    "threshold":     THRESHOLDS["icmp_payload_threshold"],
                 }))
 
-        # ── R09 — HTTP C2 endpoint pattern ──────────────────────────────────
+        # R09: HTTP C2 pattern
         if pkt.haslayer(HTTPRequest):
-            method = pkt[HTTPRequest].Method.decode(errors="replace") if pkt[HTTPRequest].Method else ""
-            path   = pkt[HTTPRequest].Path.decode(errors="replace")   if pkt[HTTPRequest].Path   else ""
-            host   = pkt[HTTPRequest].Host.decode(errors="replace")   if pkt[HTTPRequest].Host   else ""
-            ua     = (pkt[HTTPRequest].User_Agent or b"").decode(errors="replace")
+            req = pkt[HTTPRequest]
+            method = (req.Method or b"").decode(errors="replace")
+            path = (req.Path or b"").decode(errors="replace")
+            host = (req.Host or b"").decode(errors="replace").split(":")[0]
+            ua = (req.User_Agent or b"").decode(errors="replace")
 
-            is_c2_host    = any(d in host for d in C2_DOMAINS) or dst in C2_IPS
-            is_c2_path    = any(path.endswith(ep) for ep in C2_ENDPOINTS)
-            is_c2_ua      = "curl/" in ua
+            c2_host = host in self.iocs.c2_domains or dst in self.iocs.c2_ips
+            c2_path = method == "POST" and any(path.endswith(ep) for ep in self.iocs.c2_endpoints)
+            tool_ua = ua.startswith(("curl/", "Wget/", "python-requests/")) and outbound
 
-            if is_c2_host or (is_c2_path and method == "POST") or (is_c2_ua and not self._is_internal(dst)):
-                severity = "CRITICAL" if (is_c2_host or is_c2_path) else "MEDIUM"
-                alerts.append(self._mk("HTTP_C2_PATTERN", severity, src, dst, {
-                    "method":      method,
-                    "host":        host,
-                    "path":        path,
-                    "user_agent":  ua[:80],
-                    "c2_host_hit": is_c2_host,
-                    "c2_path_hit": is_c2_path,
-                }))
+            if c2_host or c2_path or tool_ua:
+                alerts.append(self._mk(
+                    "HTTP_C2_PATTERN", "CRITICAL" if (c2_host or c2_path) else "MEDIUM",
+                    src, dst, dst if outbound else None, {
+                        "method": method,
+                        "host": host,
+                        "path": path,
+                        "user_agent": ua[:80],
+                        "c2_host": c2_host,
+                        "c2_endpoint": c2_path,
+                    },
+                ))
 
         return alerts
 
-    # ── Private helpers ──────────────────────────────────────────────────────
-
-    def _is_internal(self, ip: str) -> bool:
-        try:
-            addr = ipaddress.ip_address(ip)
-            return any(addr in ipaddress.ip_network(net) for net in INTERNAL_SUBNETS)
-        except ValueError:
-            return False
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _entropy(s: str) -> float:
         if not s:
             return 0.0
-        from collections import Counter
-        freq = Counter(s)
         total = len(s)
-        return -sum((c / total) * math.log2(c / total) for c in freq.values())
+        return -sum((c / total) * math.log2(c / total) for c in Counter(s).values())
 
     @staticmethod
     def _decode_dns(raw) -> str:
         if isinstance(raw, bytes):
-            return raw.decode(errors="replace").rstrip(".")
-        return str(raw).rstrip(".")
+            return raw.decode(errors="replace").rstrip(".").lower()
+        return str(raw).rstrip(".").lower()
+
+    @staticmethod
+    def _dport(pkt) -> int:
+        if pkt.haslayer(TCP):
+            return pkt[TCP].dport
+        if pkt.haslayer(UDP):
+            return pkt[UDP].dport
+        return 0
 
     @staticmethod
     def _proto_name(pkt) -> str:
-        if pkt.haslayer(TCP):  return "TCP"
-        if pkt.haslayer(UDP):  return "UDP"
-        if pkt.haslayer(ICMP): return "ICMP"
+        for layer, name in ((TCP, "TCP"), (UDP, "UDP"), (ICMP, "ICMP")):
+            if pkt.haslayer(layer):
+                return name
         return "IP"
 
     @staticmethod
-    def _mk(rule: str, severity: str, src: str, dst: str, details: dict) -> dict:
-        return {"rule": rule, "severity": severity, "src": src, "dst": dst, "details": details}
+    def _mk(rule: str, severity: str, src: str, dst: str, offender: str | None, details: dict) -> dict:
+        return {
+            "rule": rule, "severity": severity, "src": src, "dst": dst,
+            "offender": offender, "details": details,
+        }

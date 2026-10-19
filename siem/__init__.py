@@ -1,1 +1,1 @@
-# G-SEC-910 SIEM package
+"""Network SIEM: C2, exfiltration and reconnaissance detection."""

@@ -1,35 +1,29 @@
 """
-Structured JSON logger for SIEM alerts.
+Structured JSON Lines logger for SIEM alerts (ready for ingestion by jq, Elastic, Splunk…).
 """
+from __future__ import annotations
+
 import json
-import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+SEVERITIES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
 
 
 class SIEMLogger:
-    SEVERITIES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
-
     def __init__(self, log_path: str) -> None:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        self._path = log_path
+        self.path = log_path
 
-    def log(
-        self,
-        rule: str,
-        severity: str,
-        src: str,
-        dst: str,
-        details: dict,
-    ) -> dict:
-        assert severity in self.SEVERITIES, f"Unknown severity: {severity}"
+    def log(self, alert: dict, epoch: float | None = None) -> dict:
+        """Append one alert. `epoch` is the event time (packet time in replay mode)."""
+        if alert["severity"] not in SEVERITIES:
+            raise ValueError(f"Unknown severity: {alert['severity']}")
         entry = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "rule":      rule,
-            "severity":  severity,
-            "src":       src,
-            "dst":       dst,
-            "details":   details,
+            "timestamp": (datetime.fromtimestamp(epoch, timezone.utc) if epoch is not None
+                          else datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **alert,
         }
-        with open(self._path, "a") as fh:
+        with open(self.path, "a") as fh:
             fh.write(json.dumps(entry) + "\n")
         return entry

@@ -1,100 +1,92 @@
-#!/usr/bin/env python3
 """
-G-SEC-910 — Custom SIEM for Hôpital Mandé
+Network SIEM: C2, exfiltration and reconnaissance detection with active response.
+
 Usage:
-    sudo python3 -m siem [-i eth0] [--block] [--log /tmp/siem_logs/alerts.jsonl]
+    sudo python -m siem -i eth0 [--block]          # live capture
+    python -m siem --pcap capture.pcap              # offline replay, no root needed
 """
+from __future__ import annotations
+
 import argparse
 import sys
 
+from .alert import AlertDispatcher
+from .capture import SIEMCapture
 from .config import (
-    INTERFACE, LOG_FILE,
-    DISCORD_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    DEFAULT_IOCS,
+    DISCORD_WEBHOOK_URL,
+    INTERFACE,
+    LOG_FILE,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    IOCs,
 )
-from .capture    import SIEMCapture
-from .rules      import DetectionEngine
-from .alert      import AlertDispatcher
-from .logger     import SIEMLogger
+from .firewall import Firewall
+from .logger import SIEMLogger
+from .rules import DetectionEngine
+from .rules import __doc__ as RULES_DOC
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="G-SEC-910 Custom SIEM — Hôpital Mandé",
+        prog="siem",
+        description="Network SIEM: C2, exfiltration and reconnaissance detection with active response.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Rules active:
-  R01 C2_DIRECT_HIT    — connexion vers IP/domaine C2 connu (goog1e.eu)
-  R02 C2_BEACON        — beaconing régulier vers IP externe
-  R03 C2_EXFIL_VOLUME  — volume excessif sortant (exfiltration)
-  R04 C2_SUSPICIOUS_PORT — port reverse-shell connu
-  R05 DNS_HIGH_RATE    — volume DNS anormal (DGA/tunnel)
-  R06 DNS_DGA_SUSPECT  — entropie Shannon élevée sur domaine
-  R07 PORT_SCAN        — balayage de ports
-  R08 ICMP_DATA_TUNNEL — tunnel ICMP (payload > 64 bytes)
-  R09 HTTP_C2_PATTERN  — requête HTTP vers endpoint C2 connu
-""",
+        epilog="Rules:\n" + "\n".join(
+            "  " + line for line in RULES_DOC.splitlines() if line.startswith("R")
+        ),
     )
-    parser.add_argument(
-        "-i", "--interface",
-        default=INTERFACE,
-        help=f"Interface réseau à sniffer (défaut: {INTERFACE})",
-    )
-    parser.add_argument(
-        "--block",
-        action="store_true",
-        help="Mode actif — bloque automatiquement via iptables les IPs HIGH/CRITICAL",
-    )
-    parser.add_argument(
-        "--log",
-        default=LOG_FILE,
-        help=f"Chemin du fichier de logs JSON (défaut: {LOG_FILE})",
-    )
-    parser.add_argument(
-        "--filter",
-        default="",
-        help="Filtre BPF Scapy (ex: 'host 116.202.5.225')",
-    )
-    parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Mode silencieux — n'affiche que les alertes CRITICAL",
-    )
-    args = parser.parse_args()
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("-i", "--interface", default=INTERFACE, help=f"interface to sniff (default: {INTERFACE})")
+    source.add_argument("--pcap", help="replay a capture file instead of sniffing live")
+    parser.add_argument("--filter", default="", help="BPF filter for live capture (e.g. 'not port 22')")
+    parser.add_argument("--iocs", help="JSON file of IOCs (c2_ips, c2_domains, c2_endpoints)")
+    parser.add_argument("--block", action="store_true", help="block HIGH/CRITICAL offenders with iptables")
+    parser.add_argument("--dry-run", action="store_true", help="with --block: report blocks without touching iptables")
+    parser.add_argument("--log", default=LOG_FILE, help=f"JSON Lines alert log (default: {LOG_FILE})")
+    parser.add_argument("-q", "--quiet", action="store_true", help="only print CRITICAL alerts")
+    return parser
 
-    # ── Bootstrap ─────────────────────────────────────────────────────────
-    engine     = DetectionEngine()
-    dispatcher = AlertDispatcher(
-        discord_webhook  = DISCORD_WEBHOOK_URL or None,
-        telegram_token   = TELEGRAM_BOT_TOKEN  or None,
-        telegram_chat_id = TELEGRAM_CHAT_ID    or None,
-    )
-    logger  = SIEMLogger(args.log)
-    capture = SIEMCapture(
-        interface  = args.interface,
-        engine     = engine,
-        dispatcher = dispatcher,
-        logger     = logger,
-        block_mode = args.block,
-        verbose    = not args.quiet,
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    iocs = IOCs.from_file(args.iocs) if args.iocs else DEFAULT_IOCS
+    dispatcher = AlertDispatcher(DISCORD_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    firewall = Firewall(dry_run=args.dry_run) if args.block else None
+    pipeline = SIEMCapture(
+        engine=DetectionEngine(iocs),
+        dispatcher=dispatcher,
+        logger=SIEMLogger(args.log),
+        firewall=firewall,
+        verbose=not args.quiet,
     )
 
-    print("=" * 60)
-    print("  G-SEC-910 SIEM — Hôpital Mandé")
-    print(f"  Interface : {args.interface}")
+    print("=" * 64)
+    print(f"  Source    : {'pcap ' + args.pcap if args.pcap else 'interface ' + args.interface}")
+    print(f"  IOCs      : {len(iocs.c2_ips)} IPs, {len(iocs.c2_domains)} domains")
+    print(f"  Response  : {'iptables block' + (' (dry run)' if args.dry_run else '') if args.block else 'passive'}")
+    print(f"  Alerting  : {', '.join(dispatcher.channels) or 'console + log only'}")
     print(f"  Log file  : {args.log}")
-    print(f"  Block mode: {'YES (iptables)' if args.block else 'NO (passive)'}")
-    print(f"  Discord   : {'configured' if DISCORD_WEBHOOK_URL else 'NOT configured'}")
-    print(f"  Telegram  : {'configured' if TELEGRAM_BOT_TOKEN else 'NOT configured'}")
-    print("=" * 60)
+    print("=" * 64)
 
     try:
-        capture.start(packet_filter=args.filter)
+        if args.pcap:
+            pipeline.replay(args.pcap)
+        else:
+            pipeline.live(args.interface, args.filter)
     except PermissionError:
-        print("[ERROR] Permission denied — run as root (sudo)", file=sys.stderr)
-        sys.exit(1)
+        print("[ERROR] Live capture needs root (or CAP_NET_RAW). Use --pcap to replay a file.", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
-        print("\n[SIEM] Stopped by user.")
+        print("\n[SIEM] Stopped.")
+
+    s = pipeline.stats
+    print(f"\n[SIEM] {s['packets']} packets, {s['alerts']} alerts ({s['suppressed']} duplicates suppressed)")
+    if firewall and firewall.blocked:
+        print(f"[SIEM] Blocked: {', '.join(sorted(firewall.blocked))}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

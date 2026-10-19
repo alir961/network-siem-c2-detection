@@ -1,37 +1,34 @@
 """
-SIEM Configuration — G-SEC-910 Hôpital Mandé
-"""
+SIEM configuration.
 
-INTERFACE = "eth0"
+Network-specific values (interface, subnets, IOCs) live here. Secrets for
+alert channels are read from the environment and never stored in this file.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+INTERFACE = os.environ.get("SIEM_INTERFACE", "eth0")
 
 INTERNAL_SUBNETS = [
-    "192.168.5.0/24",
+    "192.168.0.0/16",
     "10.0.0.0/8",
     "172.16.0.0/12",
     "127.0.0.0/8",
 ]
 
 WHITELIST_IPS: set[str] = set()
-WHITELIST_PORTS: set[int] = {22, 53, 80, 443, 123}
-
-# IOCs confirmed by Phase 2 malware analysis
-C2_IPS: set[str] = {"116.202.5.225"}
-C2_DOMAINS: set[str] = {"goog1e.eu"}
-C2_PORTS: set[int] = {80}
-C2_USER_AGENT_FRAGMENT = "curl/"
-C2_ENDPOINTS: list[str] = [
-    "/ping", "/beacon", "/upload", "/result",
-    "/agent_version", "/agent_download",
-]
-
-MALWARE_SHA256 = "47db8dff4de1802323f6926d4ae36a5a270ce27088c565f4123079d64149ac79"
 
 THRESHOLDS = {
-    "beaconing_window_sec":   120,
+    "beaconing_window_sec":   600,
     "beaconing_min_count":    4,
-    "beaconing_variance_max": 10.0,
+    "beaconing_jitter_ratio": 0.1,
     "beaconing_min_interval": 5.0,
     "exfil_bytes_threshold":  200_000,
+    "exfil_window_sec":       300,
     "dns_rate_window_sec":    60,
     "dns_rate_threshold":     30,
     "dga_entropy_threshold":  3.5,
@@ -46,9 +43,38 @@ THRESHOLDS = {
     "alert_dedup_window_sec": 60,
 }
 
-DISCORD_WEBHOOK_URL = ""
-TELEGRAM_BOT_TOKEN  = ""
-TELEGRAM_CHAT_ID    = ""
+# Alert channels: set these in the environment, never commit them.
+DISCORD_WEBHOOK_URL = os.environ.get("SIEM_DISCORD_WEBHOOK", "")
+TELEGRAM_BOT_TOKEN  = os.environ.get("SIEM_TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("SIEM_TELEGRAM_CHAT_ID", "")
 
-LOG_DIR  = "/tmp/siem_logs"
+LOG_DIR  = os.environ.get("SIEM_LOG_DIR", "/tmp/siem_logs")
 LOG_FILE = f"{LOG_DIR}/alerts.jsonl"
+
+
+@dataclass
+class IOCs:
+    """Indicators of compromise the engine matches against."""
+    c2_ips: set[str] = field(default_factory=set)
+    c2_domains: set[str] = field(default_factory=set)
+    c2_endpoints: list[str] = field(default_factory=list)
+    malware_sha256: set[str] = field(default_factory=set)
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> IOCs:
+        data = json.loads(Path(path).read_text())
+        return cls(
+            c2_ips=set(data.get("c2_ips", [])),
+            c2_domains=set(data.get("c2_domains", [])),
+            c2_endpoints=list(data.get("c2_endpoints", [])),
+            malware_sha256=set(data.get("malware_sha256", [])),
+        )
+
+
+# IOCs extracted from the malware analysed during the incident (see docs/INCIDENT.md)
+DEFAULT_IOCS = IOCs(
+    c2_ips={"116.202.5.225"},
+    c2_domains={"goog1e.eu"},
+    c2_endpoints=["/ping", "/beacon", "/upload", "/result", "/agent_version", "/agent_download"],
+    malware_sha256={"47db8dff4de1802323f6926d4ae36a5a270ce27088c565f4123079d64149ac79"},
+)
