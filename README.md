@@ -4,13 +4,15 @@
 
 A lightweight, packet-level SIEM written in Python and Scapy. It detects **command-and-control beaconing, data exfiltration, DNS abuse, scans and tunnels**, alerts in real time (Discord / Telegram / JSON Lines), and can **contain threats automatically** with iptables.
 
-It was built during an incident response on a compromised bastion host whose IDS was blind to the implant's traffic. The detection rules come from reverse-engineering the malware. Read the full investigation: **[docs/INCIDENT.md](docs/INCIDENT.md)**.
+> **School project** (Epitech, M2 defensive-security module): an incident-response exercise on a simulated hospital network.
+
+In the exercise, a bastion host had been compromised and its IDS was blind to the implant's traffic. I reverse-engineered the malware sample and turned its behaviour into the detection rules below. Read the full investigation: **[docs/INCIDENT.md](docs/INCIDENT.md)**.
 
 ## Demo
 
 Requirements: Python 3.10+. Live capture also needs root (or `CAP_NET_RAW`) and, for `--block`, iptables.
 
-Replay the bundled capture. It's synthetic traffic modelled on the real incident, so you don't need root or a live network:
+Replay the bundled capture. It's synthetic traffic modelled on the exercise, so you don't need root or a live network:
 
 ```bash
 pip install -e .
