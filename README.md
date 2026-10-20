@@ -8,6 +8,8 @@ It was built during an incident response on a compromised bastion host whose IDS
 
 ## Demo
 
+Requirements: Python 3.10+. Live capture also needs root (or `CAP_NET_RAW`) and, for `--block`, iptables.
+
 Replay the bundled capture. It's synthetic traffic modelled on the real incident, so you don't need root or a live network:
 
 ```bash
