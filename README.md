@@ -8,14 +8,41 @@ A lightweight, packet-level SIEM written in Python and Scapy. It detects **comma
 
 In the exercise, a bastion host had been compromised and its IDS was blind to the implant's traffic. I reverse-engineered the malware sample and turned its behaviour into the detection rules below. Read the full investigation: **[docs/INCIDENT.md](docs/INCIDENT.md)**.
 
-## Demo
+## Supported platforms
 
-Requirements: Python 3.10+. Live capture also needs root (or `CAP_NET_RAW`) and, for `--block`, iptables.
+| OS | Pcap replay and tests | Live capture | `--block` (iptables) |
+|---|---|---|---|
+| Linux | Yes (CI: Ubuntu, Python 3.10 and 3.12) | Yes | Yes |
+| macOS | Yes | Not tested | No (no iptables) |
+| Windows | Yes (use `.venv\Scripts\activate`) | Not tested (Scapy needs [Npcap](https://npcap.com)) | No (no iptables) |
+
+Use Linux for live detection and active response. On Windows, WSL 2 runs the replay and the tests, but it only sees its own virtual network interface.
+
+## Requirements
+
+- **Python 3.10+** with `venv` and `pip` (tested on 3.10, 3.12 and 3.14)
+- Dependencies, installed by pip: Scapy ≥ 2.5 and requests
+- Pcap replay (the demo) needs nothing else: no root, no network
+- **Live capture**: Linux, root or the `CAP_NET_RAW` capability, and **libpcap** (`tcpdump` package) for `--filter` BPF expressions
+- **`--block`** without `--dry-run`: **iptables** and root
+
+## Install
+
+```bash
+git clone https://github.com/alir961/network-siem-c2-detection.git
+cd network-siem-c2-detection
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .            # also installs a `siem` command, same as `python -m siem`
+```
+
+A virtual environment is needed on distributions that protect the system Python (Debian 12+, Ubuntu 23.04+, Arch, Fedora): a plain `pip install` there fails with `externally-managed-environment`.
+
+## Demo
 
 Replay the bundled capture. It's synthetic traffic modelled on the exercise, so you don't need root or a live network:
 
 ```bash
-pip install -e .
 python -m siem --pcap demo/incident.pcap --block --dry-run
 ```
 
@@ -64,15 +91,33 @@ Full output: [docs/demo-output.txt](docs/demo-output.txt). The capture also cont
 ## Usage
 
 ```bash
-# Live capture (needs root or CAP_NET_RAW)
-sudo -E python -m siem -i eth0 --block --filter "not port 22"
+# Live capture: run the venv's Python as root (sudo does not keep the activated venv)
+ip -br link                                   # find your interface name (eth0, enp3s0, wlan0...)
+sudo -E .venv/bin/python -m siem -i eth0 --block --filter "not port 22"
 
-# Offline analysis of a capture
+# Offline analysis of a capture (.pcap or .pcapng)
 python -m siem --pcap suspicious.pcap
 
 # Custom IOCs
 python -m siem --pcap suspicious.pcap --iocs iocs.example.json
 ```
+
+Stop a live capture with Ctrl+C; the SIEM prints a summary and the addresses it blocked. Rules added by `--block` stay in iptables: list them with `sudo iptables -S | grep DROP` and remove one with `sudo iptables -D INPUT -s <ip> -j DROP` and `sudo iptables -D OUTPUT -d <ip> -j DROP`.
+
+| Option | Purpose |
+|---|---|
+| `-i`, `--interface` | interface to sniff (default `eth0`, or `SIEM_INTERFACE`) |
+| `--pcap FILE` | replay a capture file instead of sniffing live |
+| `--filter BPF` | BPF filter for live capture, e.g. `"not port 22"` |
+| `--iocs FILE` | JSON file with `c2_ips`, `c2_domains`, `c2_endpoints` (see [`iocs.example.json`](iocs.example.json)) |
+| `--block` | block HIGH and CRITICAL offenders with iptables |
+| `--dry-run` | with `--block`: report the blocks without touching iptables |
+| `--log FILE` | JSON Lines alert log (default `/tmp/siem_logs/alerts.jsonl`) |
+| `-q`, `--quiet` | only print CRITICAL alerts |
+
+`python -m siem --help` lists the options and the rules.
+
+Alert channels are optional and read from the environment:
 
 | Variable | Purpose |
 |---|---|
@@ -85,7 +130,7 @@ Detection thresholds are in [`siem/config.py`](siem/config.py).
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"   # in the venv: adds pytest and Ruff
 pytest          # 26 tests: every rule, plus false-positive cases, response safety and replay
 ruff check .
 python tools/make_demo_pcap.py demo/incident.pcap   # regenerate the demo capture
