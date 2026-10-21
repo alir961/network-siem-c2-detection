@@ -28,6 +28,7 @@ from scapy.layers.inet import ICMP, IP, TCP, UDP
 from .config import DEFAULT_IOCS, INTERNAL_SUBNETS, THRESHOLDS, WHITELIST_IPS, IOCs
 
 _INTERNAL_NETS = [ipaddress.ip_network(n) for n in INTERNAL_SUBNETS]
+PRUNE_INTERVAL_SEC = 10.0
 
 
 def is_internal(ip: str) -> bool:
@@ -52,6 +53,7 @@ class DetectionEngine:
         self._dns_ts: deque = deque(maxlen=1000)
         # R07: (src, dst) -> [set of ports, window_start]
         self._scan: dict[tuple[str, str], list] = {}
+        self._last_prune = 0.0
 
     # ────────────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,8 @@ class DetectionEngine:
             return []
         if now is None:
             now = time.monotonic()
+        if now - self._last_prune >= PRUNE_INTERVAL_SEC:
+            self._prune(now)
 
         src: str = pkt[IP].src
         dst: str = pkt[IP].dst
@@ -209,6 +213,23 @@ class DetectionEngine:
         return alerts
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _prune(self, now: float) -> None:
+        """Forget hosts whose windows have expired.
+
+        Source addresses can be forged, so without this a flood of random
+        sources would grow the per-host state without limit.
+        """
+        self._last_prune = now
+        scan_cutoff = now - self.t["port_scan_window_sec"]
+        self._scan = {k: v for k, v in self._scan.items() if v[1] >= scan_cutoff}
+        beacon_cutoff = now - self.t["beaconing_window_sec"]
+        for ip in [ip for ip, q in self._beacon.items() if not q or q[-1] < beacon_cutoff]:
+            del self._beacon[ip]
+        exfil_cutoff = now - self.t["exfil_window_sec"]
+        for ip in [ip for ip, w in self._exfil.items() if not w or w[-1][0] < exfil_cutoff]:
+            del self._exfil[ip]
+            self._exfil_total.pop(ip, None)
 
     @staticmethod
     def _entropy(s: str) -> float:

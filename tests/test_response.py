@@ -8,6 +8,7 @@ from scapy.utils import wrpcap
 
 from siem.alert import AlertDispatcher
 from siem.capture import SIEMCapture
+from siem.config import system_resolvers
 from siem.firewall import Firewall
 from siem.logger import SIEMLogger
 from siem.main import main
@@ -60,3 +61,16 @@ def test_replay_logs_packet_time_and_blocks(tmp_path, capsys):
     assert entries[0]["rule"] == "C2_DIRECT_HIT"
     assert entries[0]["timestamp"] == "2026-03-05T04:00:00Z"
     assert "Blocked: 116.202.5.225" in capsys.readouterr().out
+
+
+def test_never_blocks_protected_addresses_even_from_a_forged_scan():
+    fw = Firewall(dry_run=True, never_block={"1.1.1.1"})
+    assert fw.should_block(alert("1.1.1.1", "CRITICAL")) is None
+    assert fw.should_block(alert("1.2.3.4")) == "1.2.3.4"
+
+
+def test_resolvers_are_read_from_resolv_conf(tmp_path):
+    conf = tmp_path / "resolv.conf"
+    conf.write_text("# generated\nnameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\nsearch lan\n")
+    assert system_resolvers(str(conf)) == {"1.1.1.1", "2606:4700:4700::1111"}
+    assert system_resolvers(str(tmp_path / "missing")) == set()

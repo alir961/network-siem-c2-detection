@@ -170,3 +170,16 @@ def test_curl_user_agent_is_medium():
 def test_normal_browser_request():
     alerts = DetectionEngine().analyze(http("1.2.3.4", b"example.com", b"/index.html", b"GET"), now=0)
     assert "HTTP_C2_PATTERN" not in rules(alerts)
+
+
+# ── State pruning ───────────────────────────────────────────────────────────
+
+def test_state_of_forged_sources_is_forgotten():
+    e = DetectionEngine()
+    for i in range(5000):
+        e.analyze(syn(f"10.{i // 250}.{i % 250}.9", "93.184.216.34", 80), now=i * 0.001)
+    assert len(e._scan) == 5000
+    e.analyze(syn(HOST, "93.184.216.34", 443), now=1000.0)
+    assert len(e._scan) == 1
+    assert len(e._beacon) == 1
+    assert len(e._exfil) == 1

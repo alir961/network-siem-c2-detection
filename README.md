@@ -85,7 +85,8 @@ Full output: [docs/demo-output.txt](docs/demo-output.txt). The capture also cont
 ```
 
 - **Stateful detection** with sliding windows. The engine takes the clock as a parameter, so live capture and pcap replay share the same logic and tests are deterministic.
-- **Safe active response**: only the alert's *offender* (the external party) is blocked. Internal addresses are never blocked, so the SIEM can't cut the host off from its own gateway or DNS resolver. Rules are idempotent (`iptables -C` runs before each insert), and `--dry-run` is available.
+- **Guarded active response**: only the alert's *offender* (the external party) is blocked. Internal addresses, the DNS resolvers listed in `/etc/resolv.conf` and the addresses in `SIEM_NEVER_BLOCK` are never blocked. This matters because the source of a scan can be forged: a spoofed scan "from" a public resolver would otherwise cut the host's DNS. Any other external address can still be blocked through a forged scan, so list the services you depend on in `SIEM_NEVER_BLOCK`. Rules are idempotent (`iptables -C` runs before each insert), and `--dry-run` is available.
+- **Bounded memory**: per-host state is dropped once its window expires, so a flood of forged sources cannot grow it without limit.
 - **Secrets are never committed**: alert channels are configured through environment variables.
 
 ## Usage
@@ -124,6 +125,7 @@ Alert channels are optional and read from the environment:
 | `SIEM_DISCORD_WEBHOOK` | Discord webhook URL for alerts |
 | `SIEM_TELEGRAM_TOKEN`, `SIEM_TELEGRAM_CHAT_ID` | Telegram bot alerts |
 | `SIEM_INTERFACE`, `SIEM_LOG_DIR` | Defaults for the interface and log directory |
+| `SIEM_NEVER_BLOCK` | Comma-separated addresses `--block` must never block (DNS resolvers are already included) |
 
 Detection thresholds are in [`siem/config.py`](siem/config.py).
 

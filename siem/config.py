@@ -22,6 +22,28 @@ INTERNAL_SUBNETS = [
 
 WHITELIST_IPS: set[str] = set()
 
+
+def system_resolvers(path: str = "/etc/resolv.conf") -> set[str]:
+    """Nameservers the host uses; blocking one would break its DNS."""
+    resolvers: set[str] = set()
+    try:
+        for line in Path(path).read_text().splitlines():
+            words = line.split()
+            if len(words) >= 2 and words[0] == "nameserver":
+                resolvers.add(words[1])
+    except OSError:
+        pass
+    return resolvers
+
+
+# Addresses active response never blocks, even when they are an alert's offender.
+# The source address of a scan or an inbound packet can be forged, so without this
+# a spoofed scan "from" the public DNS resolver would cut the host's DNS.
+# Add more with SIEM_NEVER_BLOCK="1.2.3.4,5.6.7.8".
+NEVER_BLOCK_IPS: set[str] = system_resolvers() | {
+    ip.strip() for ip in os.environ.get("SIEM_NEVER_BLOCK", "").split(",") if ip.strip()
+}
+
 THRESHOLDS = {
     "beaconing_window_sec":   600,
     "beaconing_min_count":    4,
