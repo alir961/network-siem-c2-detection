@@ -143,3 +143,7 @@ CI runs lint, the test suite and a demo replay on Python 3.10 and 3.12.
 ## Tech stack
 
 Python · Scapy · iptables · Discord & Telegram APIs · pytest · Ruff · GitHub Actions
+
+## License
+
+[MIT](LICENSE)
